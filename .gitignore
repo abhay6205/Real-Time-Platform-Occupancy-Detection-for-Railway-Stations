@@ -1,0 +1,25 @@
+# Python
+*.pyc
+__pycache__/
+.pytest_cache/
+venv/
+env/
+.env
+
+# Models
+*.pt
+*.pth
+*.pth.tar
+models/
+
+# Frontend (Node.js)
+frontend/node_modules/
+frontend/dist/
+frontend/build/
+.DS_Store
+
+# Data & Media
+storage/*.db
+storage/*.csv
+storage/*.log
+videos/
