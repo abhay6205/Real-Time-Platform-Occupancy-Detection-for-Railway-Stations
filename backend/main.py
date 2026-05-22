@@ -1,17 +1,18 @@
-import time
-import cv2
-import threading
-import uvicorn
-from datetime import datetime, timezone
+import time  # PURPOSE: Adds timing delays to prevent system resource exhaustion and allow graceful server startup
+import cv2  # PURPOSE: OpenCV - core library for video capture, frame processing, drawing annotations, and heatmap visualization
+import threading  # PURPOSE: Enables multi-threading to run FastAPI server in background daemon thread without blocking the main AI detection loop
+import uvicorn  # PURPOSE: ASGI application server - runs FastAPI backend so multiple clients (React dashboard) can connect and fetch real-time occupancy data concurrently
 
-import config
-from detector.video_capture import VideoCapture
-from detector.frame_processor import FrameProcessor
-from counter.person_counter import PersonCounter
-from counter.density_classifier import DensityClassifier
-from storage.logger import OccupancyLogger
-from api.server import app, update_record, update_frame
-from api.models import OccupancyRecord
+from datetime import datetime, timezone  # PURPOSE: Generates ISO 8601 formatted timestamps (timezone-aware UTC) for every occupancy record logged to database and API
+
+import config  # PURPOSE: Central configuration management - stores all tunable parameters (thresholds, model paths, API settings) so engineers can modify behavior without editing code
+from detector.video_capture import VideoCapture  # PURPOSE: Wrapper for cv2.VideoCapture - handles RTSP streams, MP4 files, webcams with automatic metadata extraction and error handling
+from detector.frame_processor import FrameProcessor  # PURPOSE: Implements frame skipping logic to process 1 frame every N frames, reducing GPU load while maintaining analytical accuracy
+from counter.person_counter import PersonCounter  # PURPOSE: Applies Exponential Moving Average (EMA) smoothing to raw AI counts to eliminate flickering and provide stable UI display
+from counter.density_classifier import DensityClassifier  # PURPOSE: Classifies numerical crowd counts into semantic states (Low/Medium/High) with color codes for intuitive operator understanding
+from storage.logger import OccupancyLogger  # PURPOSE: Dual-persistence logging - writes records to both SQLite database (queryable history) and CSV file (data recovery/backup)
+from api.server import app, update_record, update_frame  # PURPOSE: FastAPI application and state management functions - app runs the REST API, update_record/update_frame manage global state for concurrent API clients
+from api.models import OccupancyRecord  # PURPOSE: Pydantic data validation model - enforces strict schema for occupancy records (count, density, timestamp, color) across API and database
 
 def main():
     """
@@ -55,15 +56,19 @@ def main():
     # We run FastAPI via uvicorn in a daemon thread. A daemon thread automatically 
     # dies when the main program closes, preventing zombie processes.
     print(f"Starting API server on {config.API_HOST}:{config.API_PORT}...")
+    
+    # threading.Thread: Creates a separate execution thread so FastAPI server runs concurrently with AI detection loop
+    # WITHOUT threading, uvicorn.run() would block forever and no frames would be processed
     thread = threading.Thread(
-        target=uvicorn.run,
+        target=uvicorn.run,  # uvicorn: Runs the ASGI application (FastAPI) on specified host:port to serve REST API endpoints
         args=(app,),
         kwargs={"host": config.API_HOST, "port": config.API_PORT, "log_level": "error"},
         daemon=True
     )
     thread.start()
     
-    # Provide a brief grace period for the server socket to bind before hammering it with data
+    # time.sleep(1): Pauses main thread for 1 second, giving uvicorn time to bind to socket before API requests arrive
+    # This prevents connection refused errors at startup
     time.sleep(1)  
 
     print("\nDetection running. Open the React dashboard:")
@@ -73,13 +78,15 @@ def main():
     # --- Phase 4: Main Detection Loop ---
     try:
         while capture.is_opened():
-            # 1. Pull raw frame from camera/video
+            # cv2.VideoCapture.read_frame(): Pulls next frame from camera/video stream
+            # Returns None when stream ends (prevents infinite loops on finite videos)
             frame = capture.read_frame()
             if frame is None:
                 print("End of video stream or failed to read frame.")
                 break
 
-            # 2. Skip frames to maintain target FPS and prevent GPU overload
+            # FrameProcessor.should_process(): Determines if frame should be processed or skipped
+            # Skipping frames reduces GPU load from 30 FPS to ~10 FPS while maintaining accuracy
             if not processor.should_process(frame):
                 continue
 
@@ -89,9 +96,11 @@ def main():
                 result = detector.detect(frame)
                 raw_count = result['count']
                 
-                # Apply Exponential Moving Average (EMA) to prevent UI flickering
+                # PersonCounter.update_from_count(): Applies Exponential Moving Average smoothing
+                # Raw AI predictions are noisy; EMA prevents flickering (e.g., 45→40→45 becomes smooth curve)
                 smoothed = counter.update_from_count(raw_count)
 
+                # DensityClassifier: Uses config thresholds to convert numbers into semantic states
                 # Dynamically update classification thresholds in case they were changed via the API
                 classifier.low_max = config.LOW_MAX
                 classifier.high_min = config.HIGH_MIN
@@ -99,60 +108,39 @@ def main():
                 # Classify the smoothed count into actionable states ("High", "Low")
                 label, colour = classifier.classify(smoothed)
 
-                # Package the data into a strict schema
+                # datetime.now(timezone.utc).isoformat(): Generates ISO 8601 UTC timestamp
+                # Ensures all records are timestamped for historical tracking and analytics
+                # OccupancyRecord: Pydantic model validates that all fields match strict schema
                 record = OccupancyRecord(
                     count=smoothed,
                     density=label,
                     colour=colour,
-                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    timestamp=datetime.now(timezone.utc).isoformat(),  # ISO 8601 format with timezone
                     smoothed=counter.smoothed_count
                 )
 
                 # Dispatch data to the API state and persist to databases
-                update_record(record)
-                logger.log(record)
+                update_record(record)  # Makes data available to FastAPI clients (React dashboard)
+                logger.log(record)  # Writes to both SQLite DB and CSV WAL for persistence
 
-                # Visually blend the AI heatmap onto the OpenCV frame
+                # cv2.cvtColor + cv2.resize: Used in detector.annotate() to prepare density heatmap for visualization
                 annotated = detector.annotate(frame, result)
                 
-                # Overlay real-time text warnings
+                # cv2.putText(): OpenCV function to draw text overlays on frames for real-time visual feedback
+                # Helps operators immediately see crowding levels without checking dashboard
                 cv2.putText(annotated, f"Density: {label}", (10, 80),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
-
-            # [FALLBACK LOGIC PRESERVED]
-            # --- Alternate Execution Path: YOLOv8 ---
-            # else:
-            #     detections = detector.detect(frame)
-            #     count = counter.update(detections)
-            # 
-            #     classifier.low_max = config.LOW_MAX
-            #     classifier.high_min = config.HIGH_MIN
-            #     label, colour = classifier.classify(count)
-            # 
-            #     record = OccupancyRecord(
-            #         count=count,
-            #         density=label,
-            #         colour=colour,
-            #         timestamp=datetime.now(timezone.utc).isoformat(),
-            #         smoothed=counter.smoothed_count
-            #     )
-            # 
-            #     update_record(record)
-            #     logger.log(record)
-            # 
-            #     annotated = detector.annotate(frame, detections)
-            #     info_text = f"Count: {count} | Density: {label}"
-            #     cv2.putText(annotated, info_text, (10, 40),
-            #                 cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
 
             # --- Phase 5: Stream and Render ---
             # Send the annotated frame to the FastAPI thread so the React UI can fetch the MJPEG stream
             update_frame(annotated)
             
-            # Show a local debug window
+            # cv2.imshow(): Displays annotated frame in local debug window on server
+            # Useful for monitoring system behavior without accessing remote dashboard
             cv2.imshow("Railway Occupancy Detection", annotated)
             
-            # Allow graceful exit via the 'q' key
+            # cv2.waitKey(1): Waits 1ms for keyboard input, allows graceful shutdown via 'q' key
+            # Non-blocking so frame processing continues in real-time
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
@@ -160,7 +148,9 @@ def main():
         # Catch CTRL+C to prevent ugly stack traces
         print("Interrupted by user.")
     finally:
-        # Safely release hardware locks and close windows
+        # cv2.destroyAllWindows(): Closes all OpenCV display windows
+        # capture.release(): Releases hardware locks on camera/video file
+        # CRITICAL: Prevents resource leaks that would prevent next run
         capture.release()
         cv2.destroyAllWindows()
         print("System shutdown complete.")
