@@ -1,18 +1,20 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-import cv2
-import asyncio
-from .models import OccupancyRecord, ThresholdUpdate, StatusResponse
+from fastapi import FastAPI, HTTPException  # PURPOSE: FastAPI framework - creates REST API with automatic OpenAPI documentation, validates request/response schemas
+from fastapi.middleware.cors import CORSMiddleware  # PURPOSE: CORS middleware - allows React frontend (different port) to make cross-origin requests to backend API
+from fastapi.responses import StreamingResponse  # PURPOSE: Enables streaming responses for MJPEG video feed (continuous byte stream instead of single response)
+import cv2  # PURPOSE: OpenCV - compresses annotated frames to JPEG format for efficient MJPEG streaming to frontend
+import asyncio  # PURPOSE: Async/await utilities - enables non-blocking sleep during frame streaming to prevent CPU spinning
+from .models import OccupancyRecord, ThresholdUpdate, StatusResponse  # PURPOSE: Pydantic models - validate and serialize API request/response data with strict typing
 
 # Initialize the FastAPI application
+# FastAPI: Creates the REST API server that runs on localhost:8000 and serves endpoints to React dashboard
 app = FastAPI(title="Railway Occupancy Monitor API")
 
 # Configure CORS so that the React frontend (running on a different port like 5173) 
 # can make requests to this backend without browser security blocks.
+# CORSMiddleware: Adds "Access-Control-Allow-Origin" headers so browsers allow cross-origin requests
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Allow requests from any origin (production should restrict this)
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -40,7 +42,8 @@ async def generate_frames():
     """
     while True:
         if latest_frame is not None:
-            # Compress the raw OpenCV frame into a JPEG format to save bandwidth
+            # cv2.imencode('.jpg', frame): Compresses OpenCV frame from raw pixels to JPEG binary
+            # JPEG compression reduces bandwidth from ~6MB/s (uncompressed 1080p 30fps) to ~500KB/s
             ret, buffer = cv2.imencode('.jpg', latest_frame)
             if ret:
                 frame_bytes = buffer.tobytes()
@@ -48,14 +51,17 @@ async def generate_frames():
                 yield (b'--frame\r\n'
                        b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
         
-        # Sleep for ~33ms to cap the stream at approximately 30 FPS.
-        # This prevents the server from consuming 100% CPU on an infinite tight loop.
+        
+        # asyncio.sleep(0.033): Async pause for 33ms between frame yields
+        # This caps the streaming rate to ~30 FPS and prevents 100% CPU consumption
+        # asyncio.sleep is non-blocking, so other API requests can still be handled while sleeping
         await asyncio.sleep(0.033) 
 
 def update_record(record: OccupancyRecord):
     """
     Updates the global state with a new occupancy record.
     Called by the main detection loop every time a frame is processed.
+    OccupancyRecord (Pydantic model) ensures data conforms to schema before storing.
     """
     global latest_record, history
     latest_record = record
