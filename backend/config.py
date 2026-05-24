@@ -10,7 +10,7 @@ can tweak performance and thresholds without needing to understand Python.
 # 0 = Default system webcam
 # Or replace with a local file: "videos/test_video2.mp4" 
 # Or replace with an RTSP stream: "rtsp://username:password@ip_address:port/stream"
-VIDEO_SOURCE = "videos/test_videos4.mp4"
+VIDEO_SOURCE = "videos/test_videos1.mp4"
 
 # --- Detection Model Strategy ---
 # Set USE_CSRNET = True for massive crowd density estimation (Ideal for 50+ people).
