@@ -1,5 +1,5 @@
-import cv2
-import numpy as np
+import cv2  # PURPOSE: OpenCV - resizes frames to fixed dimensions for consistent neural network processing
+import numpy as np  # PURPOSE: NumPy - type hints for frame arrays (np.ndarray) and numerical operations
 
 class FrameProcessor:
     """
@@ -30,11 +30,13 @@ class FrameProcessor:
         """
         Determines whether the current frame should be fed into the AI models or discarded.
         
-        :param frame: The raw frame from the video source.
+        :param frame: The raw frame from the video source (numpy.ndarray).
         :return: True if the frame should be processed, False to skip.
         """
         self.counter += 1
-        # Modulo arithmetic ensures we only hit True every Nth frame.
+        # Modulo arithmetic: Returns True every skip_interval frames
+        # Example: skip_interval=3 means process frame at indices 3, 6, 9, 12...
+        # This reduces processing load from 30 FPS to ~10 FPS
         return self.counter % self.skip_interval == 0
 
     def preprocess(self, frame: np.ndarray) -> np.ndarray:
@@ -42,5 +44,11 @@ class FrameProcessor:
         Resizes frame to a fixed square dimension.
         (Note: Currently used mainly if the YOLO fallback is enabled, as YOLO prefers fixed 
         resolutions like 640x640 or 1280x1280. CSRNet scales dynamically based on aspect ratio).
+        
+        :param frame: Input frame as numpy array (np.ndarray)
+        :return: Resized frame as numpy array
         """
+        # cv2.resize(frame, (width, height)): Proportionally scales frame to fixed dimensions
+        # YOLO object detection requires fixed input sizes for batch processing
+        # CSRNet doesn't require this, but maintaining consistent sizes improves GPU efficiency
         return cv2.resize(frame, (self.input_size, self.input_size))
