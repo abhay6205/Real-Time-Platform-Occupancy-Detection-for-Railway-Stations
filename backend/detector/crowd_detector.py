@@ -4,12 +4,12 @@ CrowdDetector — High-Level Interface for CSRNet.
 This module acts as the bridge between raw OpenCV video frames and the raw PyTorch neural network.
 It handles all the complex data transformations required before and after AI inference.
 """
-import os
-import cv2
-import torch
-import numpy as np
-from torchvision import transforms
-from .csrnet_model import CSRNet
+import os  # PURPOSE: File system operations - checks if model weights file exists, handles file paths
+import cv2  # PURPOSE: OpenCV - resizes frames to fit GPU memory, applies colormaps for heatmap visualization, draws annotations
+import torch  # PURPOSE: PyTorch deep learning framework - loads CSRNet model, runs inference on GPU/CPU, manages tensors
+import numpy as np  # PURPOSE: NumPy arrays - stores frame data, heatmap calculations, array operations for image processing
+from torchvision import transforms  # PURPOSE: Image preprocessing pipeline - converts numpy arrays to tensors, applies ImageNet normalization
+from .csrnet_model import CSRNet  # PURPOSE: CSRNet architecture - the core neural network for crowd density estimation
 
 
 class CrowdDetector:
@@ -34,8 +34,8 @@ class CrowdDetector:
         """
         Loads the CSRNet model and pre-trained weights into Video RAM (VRAM) if a GPU is present.
         """
-        # Automatically detect if an NVIDIA GPU with CUDA drivers is available.
-        # Fallback to the system CPU if not (though this will be exponentially slower).
+        # torch.device: Automatically detects NVIDIA GPU with CUDA drivers or falls back to CPU
+        # GPU inference is 10-50x faster than CPU, critical for real-time processing
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         # Add a clear warning if CUDA isn't available, as user experience will degrade severely.
@@ -50,8 +50,10 @@ class CrowdDetector:
         # Instantiate the model architecture
         self.model = CSRNet(load_weights=True) 
         
-        # Load the massive matrix of trained "weights" from disk into memory
-        if os.path.isfile(model_path):
+        # torch.load: Loads the massive pre-trained weight matrix from disk into memory
+        # map_location ensures weights are moved to correct device (GPU or CPU)
+        # weights_only=False allows loading custom model architectures (not just weights)
+        if os.path.isfile(model_path):  # os.path.isfile: Checks if model weights file exists
             checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
             
             # Accommodate different saving formats (raw dictionary vs PyTorch checkpoint object)
@@ -65,14 +67,16 @@ class CrowdDetector:
         else:
             raise FileNotFoundError(f"CSRNet weights not found: {model_path}")
 
-        # Push the model to the GPU and set it to evaluation mode (disables training features like Dropout)
+        # model.to(device): Moves all model parameters to GPU VRAM for fast inference
+        # model.eval(): Disables training-only features (Dropout, BatchNorm) for inference
         self.model.to(self.device)
         self.model.eval()
 
-        # Define the pipeline that will convert an OpenCV image matrix into a PyTorch Tensor
+        # transforms.Compose: Creates a preprocessing pipeline for converting frames
+        # Each step transforms the data sequentially (frame → tensor → normalized tensor)
         self.transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean=self.MEAN, std=self.STD),
+            transforms.ToTensor(),  # Converts numpy BGR array to PyTorch tensor (0-1 range)
+            transforms.Normalize(mean=self.MEAN, std=self.STD),  # Applies ImageNet normalization
         ])
 
     def detect(self, frame: np.ndarray) -> dict:
@@ -80,37 +84,43 @@ class CrowdDetector:
         Runs the neural network on a single frame and returns the detection results.
         """
         # --- Performance Optimization ---
+        # cv2.resize(): Proportionally downscales large frames to prevent GPU Out-of-Memory (OOM) crashes
         # If the input frame is very high res (e.g. 1920x1080 or 4K), it creates millions of tensor 
-        # parameters which instantly causes GPU Out-of-Memory (OOM) crashes.
-        # We proportionally downscale any frame larger than 1280px to protect system stability.
+        # parameters which instantly causes GPU memory exhaustion
+        # We downscale any frame larger than 1280px to protect system stability
         h, w = frame.shape[:2]
         max_dim = max(h, w)
         if max_dim > 1280:
             scale = 1280.0 / max_dim
-            proc_frame = cv2.resize(frame, (int(w * scale), int(h * scale)))
+            proc_frame = cv2.resize(frame, (int(w * scale), int(h * scale)))  # Maintains aspect ratio
         else:
             proc_frame = frame
 
-        # OpenCV reads images in BGR format by default. Neural Networks expect RGB format.
+        # cv2.cvtColor(frame, cv2.COLOR_BGR2RGB): Converts OpenCV's BGR format to PyTorch's RGB format
+        # CRITICAL: CSRNet was trained on ImageNet RGB images; BGR channels would corrupt predictions
         rgb = cv2.cvtColor(proc_frame, cv2.COLOR_BGR2RGB)
 
-        # Apply normalisation and convert to a 4D Tensor (BatchSize=1, Channels=3, Height, Width)
+        # transforms.Compose pipeline: Converts numpy RGB array to normalized PyTorch tensor
+        # .unsqueeze(0): Adds batch dimension (1, 3, H, W) so model can process it
+        # .to(device): Moves tensor to GPU VRAM for fast computation
         input_tensor = self.transform(rgb).unsqueeze(0).to(self.device)
 
-        # We don't need to track gradients (backpropagation) during inference, 
-        # so we disable it to save massive amounts of RAM and CPU cycles.
+        # torch.no_grad(): Disables automatic differentiation tracking during inference
+        # Saves massive amounts of GPU VRAM and CPU cycles since we don't need gradients for backpropagation
         with torch.no_grad():
             if self.device.type == 'cuda':
-                # Automatic Mixed Precision (AMP): Automatically casts certain math operations from 
-                # 32-bit floats down to 16-bit floats. This nearly doubles inference speed on 
-                # modern NVIDIA Tensor cores with no loss in accuracy.
+                # torch.autocast('cuda'): Automatic Mixed Precision - uses float16 for matrix operations
+                # Speeds up inference ~2x on modern NVIDIA GPUs (Tensor cores) with negligible accuracy loss
                 with torch.autocast(device_type='cuda'):
-                    density_map = self.model(input_tensor)
+                    density_map = self.model(input_tensor)  # Runs CSRNet forward pass
             else:
                 density_map = self.model(input_tensor)
 
-        # The model returns a 2D density map. We must cast it back to standard float32,
-        # because the OpenCV drawing functions in `annotate()` will crash if given float16 AMP arrays.
+        # Convert PyTorch tensor back to NumPy array for post-processing
+        # .squeeze(): Removes batch dimension
+        # .cpu(): Moves from GPU VRAM back to RAM for NumPy operations
+        # .numpy(): Converts PyTorch tensor to NumPy array
+        # .astype(np.float32): Ensures OpenCV functions can process the array (float16 AMP would crash cv2.resize)
         density_np = density_map.squeeze().cpu().numpy().astype(np.float32)
 
         # The core logic of CSRNet: The total number of people is simply the sum of all pixels 
@@ -127,25 +137,33 @@ class CrowdDetector:
     def annotate(self, frame: np.ndarray, detection_result: dict) -> np.ndarray:
         """
         Visually blends the invisible AI density map onto the original video frame.
+        Uses OpenCV and NumPy to transform raw AI predictions into intuitive visual heatmaps.
         """
         annotated = frame.copy()
         density_map = detection_result['density_map']
         count = detection_result['count']
 
-        # Normalise the raw mathematical density values to a 0.0 - 1.0 range so it can be visualised
+        # NumPy normalization: Scales raw density values to 0.0-1.0 range for visualization
+        # density_map.max(): Finds maximum density value (e.g., 150.5)
+        # Dividing by max normalizes all values to 0-1 range for standard visualization
         if density_map.max() > 0:
             norm_map = density_map / density_map.max()
         else:
             norm_map = density_map
 
-        # The AI outputs a smaller heatmap than the original frame. Resize it back up.
+        # cv2.resize(): Upscales the smaller heatmap to match original frame dimensions
+        # CSRNet outputs smaller heatmaps for efficiency; must resize to overlay on original frame
         h, w = annotated.shape[:2]
         heatmap = cv2.resize(norm_map, (w, h))
         
-        # Scale to 0-255 for standard 8-bit image processing
+        # NumPy clipping and type conversion: Scales 0-1 range to 0-255 for 8-bit images
+        # np.clip(): Ensures all values stay within [0, 255] range
+        # .astype(np.uint8): Converts float32 to unsigned 8-bit integer (standard for images)
         heatmap = np.clip(heatmap * 255, 0, 255).astype(np.uint8)
         
-        # Apply the 'Jet' colormap. This turns low values blue and high density "hotspots" red.
+        # cv2.applyColorMap(): Applies color mapping (Jet: blue→green→yellow→red)
+        # Blue = low density (safe), Red = high density (crowded)
+        # Makes heatmap visually intuitive for operators without training
         heatmap_color = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
 
         # Alpha-blend the heatmap over the original frame. 
