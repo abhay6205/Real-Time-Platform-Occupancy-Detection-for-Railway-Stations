@@ -1,8 +1,8 @@
-import os
-import csv
-import sqlite3
-import logging
-from api.models import OccupancyRecord
+import os  # PURPOSE: File system operations - creates storage directories, checks file existence
+import csv  # PURPOSE: CSV file handling - writes occupancy records to human-readable CSV as Write-Ahead Log (WAL) for data recovery
+import sqlite3  # PURPOSE: SQLite database - stores occupancy records in queryable relational database for efficient historical retrieval
+import logging  # PURPOSE: Logging framework - records errors to console without crashing the system
+from api.models import OccupancyRecord  # PURPOSE: Pydantic model - validates occupancy record schema before logging
 
 class OccupancyLogger:
     """
@@ -23,18 +23,22 @@ class OccupancyLogger:
         self.csv_path = csv_path
         self.db_path = db_path
 
-        # Ensure the parent directory (e.g. 'storage/') actually exists before writing files
+        # os.makedirs(): Creates storage directory if it doesn't exist
+        # exist_ok=True prevents errors if directory already exists
+        # Ensures both CSV and SQLite files have a valid parent directory
         os.makedirs(os.path.dirname(self.csv_path), exist_ok=True)
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
 
-        # Initialize the CSV file with headers if it's completely new or empty
+        # csv: Initialize the CSV file with headers if it's completely new or empty
+        # Open in 'a' (append) mode to preserve existing data if file already exists
         csv_exists = os.path.isfile(self.csv_path)
         with open(self.csv_path, mode='a', newline='') as f:
             writer = csv.writer(f)
             if not csv_exists or os.path.getsize(self.csv_path) == 0:
                 writer.writerow(['timestamp', 'count', 'density', 'smoothed'])
 
-        # Initialize the SQLite database and create the table schema
+        # sqlite3: Initialize the SQLite database and create the table schema
+        # Creates occupancy table with AUTO_INCREMENT primary key for each record
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute('''
@@ -51,16 +55,21 @@ class OccupancyLogger:
     def log(self, record: OccupancyRecord):
         """
         Takes an instantaneous OccupancyRecord and writes it to both the CSV and SQLite DB.
-        This is wrapped in a try/except block so that a disk write failure doesn't 
-        crash the live AI video stream.
+        Implements dual-persistence strategy: if one storage fails, data isn't lost.
+        OccupancyRecord is already validated by Pydantic, so data is guaranteed correct schema.
         """
         try:
-            # 1. Append to the CSV Write-Ahead log
+            # csv: Append record to the Write-Ahead Log (WAL) for crash recovery
+            # CSV is human-readable and can be opened in Excel or pandas without special tools
+            # Acts as first line of data persistence - written immediately for safety
             with open(self.csv_path, mode='a', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow([record.timestamp, record.count, record.density, record.smoothed])
 
-            # 2. Insert into the structured SQLite Database
+            # sqlite3: Insert the same record into structured relational database
+            # sqlite3.connect(): Opens connection to database file (or creates if doesn't exist)
+            # Cursor executes SQL INSERT statement with parameterized query (prevents SQL injection)
+            # conn.commit(): Persists changes to disk
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
@@ -70,6 +79,8 @@ class OccupancyLogger:
                 conn.commit()
         except Exception as e:
             # Non-fatal error handling: Log it to the console but keep the system alive
+            # logging: Records error without crashing detection loop
+            # This ensures video processing continues even if disk is full or database is corrupted
             logging.error(f"Error logging record to disk: {e}")
 
     def get_recent(self, n: int = 100) -> list[dict]:
